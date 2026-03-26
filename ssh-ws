@@ -1,0 +1,237 @@
+#!/bin/bash
+show_menu() {
+	echo
+	cat <<-MENU
+    ====================================
+      SSH WebSocket Manager by NDEVXLK
+    ====================================
+    1) Install SSH-WS
+    2) Install UDPGW
+    3) Install Certificate
+    4) Change SSH Banner
+    5) Add SSH User
+    6) List SSH Users
+    7) Remove SSH User
+    8) Get SSH-WS Payload
+    9) Uninstall SSH-WS
+   10) Exit
+	MENU
+}
+set_sysctl() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^$key" /etc/sysctl.conf; then
+        sudo sed -i "s|^$key.*|$key = $value|" /etc/sysctl.conf > /dev/null 2>&1
+    else
+        echo "$key = $value" | sudo tee -a /etc/sysctl.conf > /dev/null 2>&1
+    fi
+}
+install_script() {
+    sysctl net.ipv4.tcp_available_congestion_control | grep -qw bbr || sudo modprobe tcp_bbr
+    set_sysctl 'net.core.default_qdisc' 'fq'
+    set_sysctl 'net.ipv4.tcp_congestion_control' 'bbr'
+    sudo bash -c 'cat > /etc/issue.net' << 'EOF'
+SSH WebSocket Manager by NDEVXLK
+EOF
+    sudo sed -i 's/^#Banner.*/Banner \/etc\/issue.net/' /etc/ssh/sshd_config
+    sudo systemctl restart ssh
+    install_nginx_cert
+    if [ ! -d '/opt/ssh-ws' ]; then
+        sudo mkdir /opt/ssh-ws
+        sudo wget -4 -O /opt/ssh-ws/ssh-ws.py 'https://raw.githubusercontent.com/ndevxlk/ssh-ws/main/ssh-ws.py'
+        sudo bash -c 'cat > /etc/systemd/system/ssh-ws.service' << 'EOF'
+[Unit]
+Description = Python Proxy Service
+After = network.target
+[Service]
+Type = simple
+User = root
+ExecStart = /usr/bin/python3 /opt/ssh-ws/ssh-ws.py
+Restart = always
+[Install]
+WantedBy = multi-user.target
+EOF
+        sudo systemctl daemon-reload
+        sudo systemctl enable ssh-ws.service
+        sudo systemctl start ssh-ws.service
+    fi
+    install_udpgw
+    echo -e '\nSSH-WS was installed successfully.'
+}
+uninstall_script() {
+    echo
+    read -rp 'Press enter to continue...' _
+    sudo systemctl stop nginx
+    sudo systemctl disable nginx
+    sudo apt remove --purge nginx nginx-common nginx-full -y
+    sudo ~/.acme.sh/acme.sh --uninstall
+    sudo rm -rf /etc/nginx
+    sudo rm -rf /root/.acme.sh
+    sudo rm -rf /root/cert
+    sudo systemctl stop ssh-ws.service
+    sudo systemctl disable ssh-ws.service
+    sudo rm /etc/systemd/system/ssh-ws.service
+    sudo rm -rf /opt/ssh-ws
+    sudo systemctl stop badvpn-udpgw.service
+    sudo systemctl disable badvpn-udpgw.service
+    sudo rm /etc/systemd/system/badvpn-udpgw.service
+    sudo rm /usr/bin/badvpn-udpgw
+    sudo systemctl daemon-reload
+    sudo rm /usr/local/bin/ssh-ws /dev/null 2>&1
+    echo -e '\nSSH-WS was uninstalled successfully.'
+}
+install_nginx_cert() {
+    echo
+    read -p 'Enter domain name: ' DOMAIN_NAME
+    if [[ ! $DOMAIN_NAME =~ ^(([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})$ ]]; then
+        echo -e '\nEntered domain name is invalid.'
+        return 0
+    fi
+    if [ ! -d '/etc/nginx' ]; then
+        echo
+        sudo apt update -y
+        sudo apt install nginx -y
+        sudo systemctl enable nginx
+        sudo systemctl start nginx
+    fi
+    if [ ! -d '/root/cert' ]; then
+        sudo mkdir /root/cert
+    fi
+    CERT_PATH="/root/cert/$DOMAIN_NAME"
+    if [ -d $CERT_PATH ]; then
+        echo -e '\nTLS certificate is already installed.'
+        return 0
+    fi
+    sudo mkdir -p "$CERT_PATH"
+    if [ ! -f ~/.acme.sh/acme.sh ]; then
+        echo
+        sudo curl https://get.acme.sh | sh
+    fi
+    sudo ~/.acme.sh/acme.sh --register-account -m "my@$DOMAIN_NAME"
+    sudo ~/.acme.sh/acme.sh --server letsencrypt --issue -d "$DOMAIN_NAME" -w /var/www/html --keylength ec-256 --key-file "$CERT_PATH/privkey.pem" --fullchain-file "$CERT_PATH/fullchain.pem"
+    if [ ! -f "$CERT_PATH/fullchain.pem" ] || [ ! -f "$CERT_PATH/privkey.pem" ]; then
+        sudo rm -rf "$CERT_PATH"
+        echo -e '\nFailed to issue TLS certificate.'
+        return 0
+    fi
+    sudo bash -c 'cat > /etc/nginx/sites-enabled/default' << EOF
+server {
+    listen 80;
+    listen [::]:80;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN_NAME;
+    ssl_certificate $CERT_PATH/fullchain.pem;
+    ssl_certificate_key $CERT_PATH/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/html;
+        allow all;
+        default_type "text/plain";
+        try_files \$uri = 404;
+    }
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+    location ~ ^/ws(\d+)$ {
+        set \$port \$1;
+        proxy_pass http://127.0.0.1:\$port;
+        proxy_set_header Host \$http_host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    location ~ ^/grpc(\d+)/ {
+        set \$port \$1;
+        grpc_pass grpc://127.0.0.1:\$port;
+        client_max_body_size 0;
+    }
+}
+EOF
+    sudo systemctl restart nginx
+    echo -e '\nTLS certificate was installed successfully.'
+}
+install_udpgw() {
+    if [ ! -f '/usr/bin/badvpn-udpgw' ]; then
+        if [[ "$(uname -m)" == "x86_64" ]]; then
+            sudo wget -4 -O /usr/bin/badvpn-udpgw 'https://raw.githubusercontent.com/ndevxlk/ssh-ws/main/badvpn-udpgw64'
+            sudo chmod +x /usr/bin/badvpn-udpgw
+            sudo bash -c 'cat > /etc/systemd/system/badvpn-udpgw.service' << 'EOF'
+[Unit]
+Description = badvpn-udpgw
+After = network.target
+[Service]
+Type = simple
+User = root
+ExecStart = /usr/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300
+Restart = always
+[Install]
+WantedBy = multi-user.target
+EOF
+            sudo systemctl daemon-reload
+            sudo systemctl enable badvpn-udpgw.service
+            sudo systemctl start badvpn-udpgw.service
+            echo -e '\nUDPGW was installed successfully.'
+        else
+            echo -e '\nUDPGW cannot be installed because the CPU architecture is not supported.'
+        fi
+    else
+        echo -e '\nUDPGW is already installed.'
+    fi
+}
+add_user() {
+    echo
+    read -p 'Enter SSH username: ' SSH_USERNAME
+    echo
+    read -p 'Enter SSH password: ' SSH_PASSWORD
+    echo
+    read -p 'Enter the validity period in days: ' VALIDITY_PERIOD
+    EXPIRY_DATE=$(date -d "+$VALIDITY_PERIOD days" +"%Y-%m-%d")
+    sudo useradd -e "$EXPIRY_DATE" -s /usr/sbin/nologin -M "$SSH_USERNAME"
+    echo "$SSH_USERNAME:$SSH_PASSWORD" | sudo chpasswd
+    echo -e '\nSSH user was added successfully.'
+}
+remove_user() {
+    echo
+    read -p 'Enter SSH username: ' SSH_USERNAME
+    sudo userdel -f -r $SSH_USERNAME > /dev/null 2>&1
+    echo -e '\nSSH user was removed successfully.'
+}
+list_users() {
+    echo
+    sudo awk -F: '$3>=1000 && $1!="nobody"{print $1}' /etc/passwd
+}
+change_banner() {
+    nano /etc/issue.net
+    echo -e '\nSSH banner was changed successfully.'
+}
+get_payload() {
+    echo
+    read -p 'Enter domain name: ' DOMAIN_NAME
+    echo -e "\nGET / HTTP/1.1[crlf]Host: $DOMAIN_NAME[crlf]Connection: Upgrade[crlf]Upgrade: Websocket[crlf][crlf]"
+}
+AUTH_METHOD=$(grep "$(whoami)" /var/log/auth.log | grep 'Accepted' | tail -1)
+if [[ "$AUTH_METHOD" == *'password'* ]] && [[ "$(whoami)" == 'root' ]]; then
+    :
+else
+    echo -e '\nYou must log in as root using a password to run this script.\n'
+    exit 1
+fi
+while true; do
+    show_menu
+    read -rp $'\nChoose an option. [1-10]: ' OPTION
+    case "$OPTION" in
+        1) install_script ;;
+        2) install_udpgw ;;
+        3) install_nginx_cert ;;
+        4) change_banner ;;
+        5) add_user ;;
+        6) list_users ;;
+        7) remove_user ;;
+        8) get_payload ;;
+        9) uninstall_script ;;
+       10) echo -e '\nBye.\n'; exit 0 ;;
+        *) echo -e '\nInvalid option. Choose 1-10.' ;;
+    esac
+    echo
+    read -rp 'Press enter to continue...' _
+done
