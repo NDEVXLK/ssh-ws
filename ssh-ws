@@ -37,6 +37,7 @@ EOF
     sudo sed -i 's/^#Banner.*/Banner \/etc\/issue.net/' /etc/ssh/sshd_config
     sudo systemctl restart ssh
     install_nginx_cert
+    pip show uvloop >/dev/null 2>&1 || sudo pip install uvloop --break-system-packages
     if [ ! -d '/opt/ssh-ws' ]; then
         sudo mkdir /opt/ssh-ws
         sudo wget -4 -O /opt/ssh-ws/ssh-ws.py 'https://raw.githubusercontent.com/ndevxlk/ssh-ws/main/ssh-ws.py'
