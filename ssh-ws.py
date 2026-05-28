@@ -10,11 +10,12 @@ LISTEN_PORT = 3000
 TARGET_IP = '127.0.0.1'
 TARGET_PORT = 22
 BUFFER_SIZE = 16384
+TIMEOUT = 60
 RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\n\r\n'
 async def pipe(reader, writer):
     try:
         while True:
-            data = await reader.read(BUFFER_SIZE)
+            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
                 break
             writer.write(data)
@@ -25,6 +26,9 @@ async def handle_client(client_reader, client_writer):
     target_reader = None
     target_writer = None
     try:
+        client_data = await client_reader.read(BUFFER_SIZE)
+        if not client_data:
+            return
         target_reader, target_writer = await asyncio.open_connection(
             TARGET_IP,
             TARGET_PORT
