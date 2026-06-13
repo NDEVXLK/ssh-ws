@@ -126,13 +126,12 @@ server {
     ssl_certificate $CERT_PATH/fullchain.pem;
     ssl_certificate_key $CERT_PATH/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/html;
-        allow all;
-        default_type "text/plain";
-        try_files \$uri = 404;
-    }
+    root /var/www/html;
+    index index.php index.html index.htm index.nginx-debian.html;
     location / {
+        try_files \$uri \$uri/ =404;
+    }
+    location /ssh {
         proxy_pass http://127.0.0.1:3000;
     }
     location ~ ^/ws(\d+)$ {
@@ -209,7 +208,7 @@ change_banner() {
 get_payload() {
     echo
     read -p 'Enter domain name: ' DOMAIN_NAME
-    echo -e "\nGET / HTTP/1.1[crlf]Host: $DOMAIN_NAME[crlf]Connection: Upgrade[crlf]Upgrade: Websocket[crlf][crlf]"
+    echo -e "\nGET /ssh HTTP/1.1[crlf]Host: $DOMAIN_NAME[crlf]Connection: Upgrade[crlf]Upgrade: Websocket[crlf][crlf]"
 }
 AUTH_METHOD=$(grep "$(whoami)" /var/log/auth.log | grep 'Accepted' | tail -1)
 if [[ "$AUTH_METHOD" == *'password'* ]] && [[ "$(whoami)" == 'root' ]]; then
